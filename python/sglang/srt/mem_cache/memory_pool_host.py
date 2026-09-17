@@ -1,10 +1,12 @@
 import abc
+import ctypes
 import logging
 import threading
 from collections import defaultdict
 from functools import wraps
 from typing import Optional
 
+import numpy as np
 import psutil
 import torch
 
@@ -73,7 +75,80 @@ class HostTensorAllocator(abc.ABC):
         return tensor
 
 
-def get_allocator_from_storage(allocator_type):
+class NumaMemoryHolder:
+    """Keep numa-allocated memory alive until the tensor is garbage collected."""
+
+    def __init__(self, ptr, size, array, libnuma):
+        self.ptr = ptr
+        self.size = size
+        self.array = array  # keep numpy array alive
+        self.libnuma = libnuma
+
+    def __del__(self):
+        self.libnuma.numa_free(self.ptr, self.size)
+
+
+class NumaHostTensorAllocator(HostTensorAllocator):
+    """Allocate host tensors on a specific NUMA node using libnuma."""
+
+    def __init__(self, numa_node: int):
+        super().__init__()
+        self.numa_node = numa_node
+        try:
+            self.libnuma = ctypes.CDLL("libnuma.so.1", use_errno=True)
+        except OSError:
+            raise RuntimeError(
+                "libnuma.so.1 not found. Please install numactl/libnuma."
+            )
+        self.libnuma.numa_alloc_onnode.restype = ctypes.c_void_p
+        self.libnuma.numa_alloc_onnode.argtypes = [ctypes.c_size_t, ctypes.c_int]
+        self.libnuma.numa_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        numel = 1
+        for d in dims:
+            numel *= d
+
+        if dtype.is_floating_point:
+            element_size = torch.finfo(dtype).bits // 8
+        else:
+            element_size = torch.iinfo(dtype).bits // 8
+
+        size_bytes = numel * element_size
+
+        ptr = self.libnuma.numa_alloc_onnode(size_bytes, self.numa_node)
+        if not ptr:
+            errno = ctypes.get_errno()
+            raise RuntimeError(
+                f"numa_alloc_onnode(node={self.numa_node}, size={size_bytes}) "
+                f"failed with errno={errno}"
+            )
+
+        # Create a numpy array view over the numa pointer (no copy)
+        array = np.ctypeslib.as_array(
+            ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)),
+            shape=(size_bytes,),
+        )
+
+        # Create a torch tensor sharing the same memory
+        tensor = torch.from_numpy(array).view(dtype).reshape(dims)
+
+        # Attach holder so memory is freed when tensor is garbage collected
+        holder = NumaMemoryHolder(ptr, size_bytes, array, self.libnuma)
+        tensor._numa_holder = holder
+        
+        # Force immediate NUMA page allocation on the target node.
+        # numa_alloc_onnode only sets the binding policy; pages are allocated
+        # lazily on first access. Without this touch, numastat will not show
+        # the memory on Node 4 until the KV cache is actually used.
+        tensor.zero_()
+        return tensor
+
+
+def get_allocator_from_storage(allocator_type, numa_node: Optional[int] = None):
+    if numa_node is not None:
+        return NumaHostTensorAllocator(numa_node)
+
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -145,13 +220,18 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        numa_node: Optional[int] = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        self.allocator = get_allocator_from_storage(allocator_type, numa_node)
+        logger.info(
+            f"HostKVCache init: allocator_type={allocator_type}, "
+            f"numa_node={numa_node}, allocator={type(self.allocator).__name__}"
+        )
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -248,9 +328,22 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Last logged usage percentage, for throttled usage logging.
+        self._last_usage_log_pct = 0.0
 
     def available_size(self):
         return len(self.free_slots)
+
+    def _log_usage(self):
+        # Log host pool usage when it changes by >= 5 percentage points.
+        used = self.size - len(self.free_slots)
+        pct = used / self.size * 100
+        if abs(pct - self._last_usage_log_pct) >= 5:
+            self._last_usage_log_pct = pct
+            logger.info(
+                f"HiCache host pool usage: {used}/{self.size} tokens ({pct:.1f}%), "
+                f"{used * self.size_per_token / 1e9:.2f}/{self.size * self.size_per_token / 1e9:.2f} GB"
+            )
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -263,11 +356,13 @@ class HostKVCache(abc.ABC):
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        self._log_usage()
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
         self.free_slots = torch.cat([self.free_slots, indices])
+        self._log_usage()
         return len(indices)
 
 
@@ -284,6 +379,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        numa_node: Optional[int] = None,
     ):
         super().__init__(
             device_pool,
@@ -294,6 +390,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            numa_node,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -745,6 +842,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        numa_node: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -756,6 +854,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            numa_node,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
@@ -1086,6 +1185,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        numa_node: Optional[int] = None,
     ):
         # Initialize indexer metadata before HostKVCache.__init__ calls get_size_per_token.
         self.index_head_dim = device_pool.index_head_dim
@@ -1105,6 +1205,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device,
             allocator_type,
             override_kv_cache_dim=device_pool.kv_cache_dim,
+            numa_node=numa_node,
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize

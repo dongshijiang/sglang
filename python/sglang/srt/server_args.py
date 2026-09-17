@@ -708,6 +708,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     disable_hicache_numa_detect: bool = False
+    hicache_numa_node: Optional[int] = None
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -4760,6 +4761,14 @@ class ServerArgs:
             "--disable-hicache-numa-detect",
             action="store_true",
             help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
+        )
+        parser.add_argument(
+            "--hicache-numa-node",
+            type=int,
+            default=ServerArgs.hicache_numa_node,
+            help="Bind the host memory pool of hierarchical cache to a specific NUMA node. "
+            "If not set, the default memory allocation policy is used. "
+            "Useful for offloading HiCache to CXL/remote memory (e.g., --hicache-numa-node 4).",
         )
         parser.add_argument(
             "--hicache-storage-backend",

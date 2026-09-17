@@ -74,6 +74,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                numa_node=server_args.hicache_numa_node,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
@@ -83,6 +84,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                numa_node=server_args.hicache_numa_node,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -92,6 +94,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                numa_node=server_args.hicache_numa_node,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
