@@ -195,7 +195,11 @@ class SchedulePolicy:
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                    # New requests may match prefixes whose tail sliding
+                    # window has no restorable SWA KV (e.g. DeepSeek-V4
+                    # HiCache); those tail tokens must be recomputed.
+                    swa_tail_truncate=self.tree_cache.needs_swa_tail_truncate(),
                 )
             )
             (

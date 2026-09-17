@@ -696,7 +696,17 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        # DeepSeek-V4 (SWA allocator): a prefix restore only needs full-domain
+        # slots. SWA entries are rebuilt by recomputing the tail window, and
+        # the SWA pool is far smaller than the full domain, so allocating both
+        # would fail long before the full pool is exhausted.
+        full_allocator = getattr(
+            self.mem_pool_device_allocator, "full_attn_allocator", None
+        )
+        if full_allocator is not None:
+            device_indices = full_allocator.alloc(len(host_indices))
+        else:
+            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
         self.load_queue.append(

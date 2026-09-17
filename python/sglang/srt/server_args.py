@@ -1603,6 +1603,38 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
+            if self.enable_hierarchical_cache:
+                # DeepSeek-V4 HiCache (phase 1) constraints:
+                # - L2 host memory only (CXL/remote via --hicache-numa-node);
+                #   L3 storage backends are not supported because the V4 pools
+                #   use compressed-domain page semantics.
+                # - Mutually exclusive with HiSparse: both manage the C4 device
+                #   pool lifecycle and would corrupt each other's slot books.
+                # - layer_first layout only (matches the V4 host pool layout).
+                if self.hicache_storage_backend is not None:
+                    raise ValueError(
+                        "DeepSeek-V4 hierarchical cache only supports host "
+                        "memory (L2); storage backends (L3) are not supported "
+                        "yet. Please remove --hicache-storage-backend."
+                    )
+                if self.enable_hisparse:
+                    raise ValueError(
+                        "--enable-hisparse and --enable-hierarchical-cache are "
+                        "mutually exclusive for DeepSeek-V4: both manage the C4 "
+                        "device pool lifecycle. Please disable one of them."
+                    )
+                if self.hicache_mem_layout != "layer_first":
+                    raise ValueError(
+                        "DeepSeek-V4 hierarchical cache only supports "
+                        f"'layer_first' memory layout, got "
+                        f"'{self.hicache_mem_layout}'."
+                    )
+                if self.hicache_io_backend != "kernel":
+                    raise ValueError(
+                        "DeepSeek-V4 hierarchical cache only supports the "
+                        "'kernel' io backend, got "
+                        f"'{self.hicache_io_backend}'."
+                    )
             if self.enable_nsa_prefill_context_parallel:
                 if self.nsa_prefill_cp_mode == "round-robin-split":
                     self.moe_dense_tp_size = 1

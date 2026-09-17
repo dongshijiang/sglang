@@ -47,6 +47,26 @@ OFFLOAD_KERNEL void offload_to_cpu(const __grid_constant__ OffloadParams params)
   }
 }
 
+OFFLOAD_KERNEL void load_to_gpu(const __grid_constant__ OffloadParams params) {
+  using namespace device::hisparse;
+  const auto [gpu_caches, cpu_caches, gpu_indices, cpu_indices, num_items, num_layers] = params;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  constexpr auto kNumWarps = (kBlockSize / 32) * kBlockQuota;
+  for (auto i = global_tid / 32; i < num_items; i += kNumWarps) {
+    const int32_t gpu_index = gpu_indices[i];
+    const int32_t cpu_index = cpu_indices[i];
+    for (auto j = 0u; j < num_layers; ++j) {
+      const auto gpu_cache = gpu_caches[j];
+      const auto cpu_cache = cpu_caches[j];
+      transfer_item<TransferDirection::HostToDevice>(
+          /*dst_cache=*/gpu_cache,
+          /*src_cache=*/cpu_cache,
+          /*dst_index=*/gpu_index,
+          /*src_index=*/cpu_index);
+    }
+  }
+}
+
 [[maybe_unused]]
 void hisparse_transfer(
     tvm::ffi::TensorView gpu_ptrs,
@@ -77,6 +97,38 @@ void hisparse_transfer(
       .num_layers = static_cast<uint32_t>(L.unwrap()),
   };
   LaunchKernel(kBlockQuota, kBlockSize, device_.unwrap())(offload_to_cpu, params);
+}
+
+[[maybe_unused]]
+void hisparse_load_to_device(
+    tvm::ffi::TensorView gpu_ptrs,
+    tvm::ffi::TensorView cpu_ptrs,
+    tvm::ffi::TensorView gpu_indices,
+    tvm::ffi::TensorView cpu_indices) {
+  using namespace host;
+  auto N = SymbolicSize{"num_items"};
+  auto L = SymbolicSize{"num_layers"};
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({L})  // 1D cache pointers
+      .with_dtype<uint64_t>()
+      .with_device(device_)
+      .verify(gpu_ptrs)
+      .verify(cpu_ptrs);
+  TensorMatcher({N})  // 1D indices
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(gpu_indices)
+      .verify(cpu_indices);
+  const auto params = OffloadParams{
+      .gpu_caches = static_cast<void**>(gpu_ptrs.data_ptr()),
+      .cpu_caches = static_cast<void**>(cpu_ptrs.data_ptr()),
+      .gpu_indices = static_cast<const int64_t*>(gpu_indices.data_ptr()),
+      .cpu_indices = static_cast<const int64_t*>(cpu_indices.data_ptr()),
+      .num_items = static_cast<uint32_t>(N.unwrap()),
+      .num_layers = static_cast<uint32_t>(L.unwrap()),
+  };
+  LaunchKernel(kBlockQuota, kBlockSize, device_.unwrap())(load_to_gpu, params);
 }
 
 }  // namespace

@@ -42,6 +42,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # SWA specific: ask the cache to truncate the tail sliding-window tokens
+    # from the matched prefix (used when matching a NEW request whose SWA KV
+    # cannot be restored from the tree, e.g. DeepSeek-V4 HiCache). Running
+    # requests keep the full match since their own SWA window is still valid.
+    swa_tail_truncate: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -212,6 +218,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return []
 
     def supports_swa(self) -> bool:
+        return False
+
+    def needs_swa_tail_truncate(self) -> bool:
+        """Whether new-request prefix matching must drop the tail
+        sliding-window tokens (SWA KV not restorable from the tree)."""
         return False
 
     def supports_mamba(self) -> bool:

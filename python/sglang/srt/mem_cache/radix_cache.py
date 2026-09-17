@@ -118,6 +118,14 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # Number of LEADING tokens whose SWA (sliding-window) KV entries are
+        # invalid on device: either freed by ScheduleBatch.maybe_evict_swa
+        # while the owning request was running, or restored from host without
+        # an SWA mirror (DeepSeek-V4 HiCache phase 1). Used by HiRadixCache to
+        # cap matches so that the tail sliding window of a reused prefix is
+        # always SWA-valid. 0 = the whole node is SWA-valid.
+        self.swa_invalid_prefix_len = 0
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -472,7 +480,12 @@ class RadixCache(BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                )
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
@@ -513,6 +526,7 @@ class RadixCache(BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len

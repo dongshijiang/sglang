@@ -276,6 +276,18 @@ def _jit_hisparse_transfer_module() -> Module:
     )
 
 
+@cache_once
+def _jit_hisparse_transfer_h2d_module() -> Module:
+    # Separate module name: the D2H module may already be cached on disk with
+    # the old wrapper set; a distinct name forces a fresh build exposing
+    # hisparse_load_to_device.
+    return load_jit(
+        make_name("hisparse_transfer_h2d"),
+        cuda_files=["deepseek_v4/hisparse_transfer.cuh"],
+        cuda_wrappers=[("hisparse_load_to_device", "hisparse_load_to_device")],
+    )
+
+
 def hisparse_offload_to_host(
     gpu_ptrs: torch.Tensor,
     cpu_ptrs: torch.Tensor,
@@ -284,6 +296,21 @@ def hisparse_offload_to_host(
 ) -> None:
     module = _jit_hisparse_transfer_module()
     module.hisparse_transfer(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
+
+
+def hisparse_load_to_device(
+    gpu_ptrs: torch.Tensor,
+    cpu_ptrs: torch.Tensor,
+    gpu_indices: torch.Tensor,
+    cpu_indices: torch.Tensor,
+) -> None:
+    """Load KV items from a linear-layout host pool into paged device caches.
+
+    Symmetric counterpart of hisparse_offload_to_host. Indices and pointer
+    tensors must live on the CUDA device (int64 / uint64 respectively).
+    """
+    module = _jit_hisparse_transfer_h2d_module()
+    module.hisparse_load_to_device(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
 
 
 def topk_transform_512(

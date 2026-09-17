@@ -924,6 +924,10 @@ class Req(ReqDllmMixin):
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self if tree_cache.supports_mamba() else None,
                     cow_mamba=tree_cache.supports_mamba(),
+                    # New requests may match prefixes whose tail sliding
+                    # window has no restorable SWA KV (e.g. DeepSeek-V4
+                    # HiCache); those tail tokens must be recomputed.
+                    swa_tail_truncate=tree_cache.needs_swa_tail_truncate(),
                 )
             )
             (

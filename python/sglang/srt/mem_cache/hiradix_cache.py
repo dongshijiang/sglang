@@ -65,8 +65,32 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.sliding_window_size = params.sliding_window_size
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        # DeepSeek-V4 compressed-attention pool. Detected via the duck-type
+        # tag (avoids importing deepseekv4_memory_pool here); the SWA sub pool
+        # is not mirrored on host - the tail window is recomputed on prefix
+        # hit instead.
+        self.is_v4_model = getattr(self.kv_cache, "_is_v4_token_pool", False)
+
+        if self.is_v4_model:
+            from sglang.srt.mem_cache.deepseekv4_memory_pool_host import (
+                DeepSeekV4TokenToKVPoolHost,
+            )
+
+            self.token_to_kv_pool_host = DeepSeekV4TokenToKVPoolHost(
+                self.kv_cache,
+                full_size=params.token_to_kv_pool_allocator.size_full,
+                host_to_device_ratio=server_args.hicache_ratio,
+                host_size=server_args.hicache_size,
+                page_size=self.page_size,
+                layout=server_args.hicache_mem_layout,
+                pin_memory=True,
+                device="cpu",
+                allocator_type=server_args.hicache_storage_backend,
+                numa_node=server_args.hicache_numa_node,
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -169,6 +193,15 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def needs_swa_tail_truncate(self) -> bool:
+        return getattr(self, "is_v4_model", False)
+
+    def supports_swa(self) -> bool:
+        # DeepSeek-V4 runs as a hybrid-SWA model: the SWA sliding-window
+        # eviction (schedule_batch.maybe_evict_swa) must stay enabled while
+        # the hierarchical cache is active, otherwise the SWA pool fills up.
+        return getattr(self, "is_v4_model", False)
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -1156,6 +1189,24 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        if (
+            self.is_v4_model
+            and params.swa_tail_truncate
+            and self.sliding_window_size is not None
+            and len(value) > 0
+        ):
+            # DeepSeek-V4: the SWA sub pool is not mirrored on host and
+            # sliding-window eviction is physical, so the tail window of a
+            # matched prefix has no valid SWA KV for a NEW request. Truncate
+            # it (page-aligned) so the window gets recomputed during extend.
+            keep = len(value) - min(len(value), self.sliding_window_size)
+            keep = keep // self.page_size * self.page_size
+            if keep <= 0:
+                value = empty_value
+            elif keep < len(value):
+                value = value[:keep]
+            host_hit_length = min(host_hit_length, keep)
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1291,6 +1342,13 @@ class HiRadixCache(RadixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        # Split the SWA-validity bookkeeping: the node's invalid head is
+        # [start, start + swa_invalid_prefix_len); new_node keeps the part of
+        # the invalid head that falls inside [start, start + split_len), child
+        # keeps the remainder.
+        invalid_prefix = getattr(child, "swa_invalid_prefix_len", 0)
+        new_node.swa_invalid_prefix_len = min(invalid_prefix, split_len)
+        child.swa_invalid_prefix_len = max(0, invalid_prefix - split_len)
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -1316,6 +1374,22 @@ class HiRadixCache(RadixCache):
         node = self.root_node
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+        # Position of the current walk point in the inserted sequence (unlike
+        # total_prefix_length, this also advances over evicted/revived
+        # segments). Used to place per-node SWA-validity boundaries.
+        seq_pos = 0
+        swa_evicted_seqlen = params.swa_evicted_seqlen
+
+        def _set_swa_invalid(n: TreeNode, start: int, length: int):
+            # Tokens [start, start + length) were just (re)computed by the
+            # inserting request; its SWA entries are only valid from
+            # swa_evicted_seqlen onwards (ScheduleBatch.maybe_evict_swa frees
+            # the older ones while the request runs). Always assign (also
+            # resets stale bookkeeping on revived nodes when E == 0).
+            if self.is_v4_model:
+                n.swa_invalid_prefix_len = min(
+                    max(0, swa_evicted_seqlen - start), length
+                )
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -1328,6 +1402,7 @@ class HiRadixCache(RadixCache):
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len]
+                    _set_swa_invalid(node, seq_pos, prefix_len)
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
@@ -1343,6 +1418,7 @@ class HiRadixCache(RadixCache):
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
+                    _set_swa_invalid(new_node, seq_pos, prefix_len)
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
@@ -1353,6 +1429,7 @@ class HiRadixCache(RadixCache):
                     total_prefix_length += prefix_len
                 node = new_node
 
+            seq_pos += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
 
@@ -1364,6 +1441,7 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            _set_swa_invalid(new_node, seq_pos, len(key))
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
