@@ -194,6 +194,11 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
+    def sanity_check(self):
+        # V4 HiCache: SWARadixCache LRU-list invariants do not apply here
+        # (no LRU list; eviction walks the radix tree directly).
+        pass
+
     def needs_swa_tail_truncate(self) -> bool:
         return getattr(self, "is_v4_model", False)
 
@@ -772,7 +777,12 @@ class HiRadixCache(RadixCache):
             node = node.parent
         return delta
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None
+    ):
+        # swa_uuid_for_lock is accepted for signature compatibility with
+        # SWARadixCache (schedule_policy._lock_node passes it for any cache
+        # with supports_swa()); V4 HiCache has no SWA LRU mirror to restore.
         if self.disable:
             return 0
 
