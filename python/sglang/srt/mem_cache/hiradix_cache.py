@@ -761,6 +761,24 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    # V4 hybrid SWA accounting: the full and SWA device pools allocate and
+    # free pages in lockstep for the same tokens, so both pools' evictable /
+    # protected sizes mirror the single radix tree counters. Without these,
+    # the runtime checker falls back to BasePrefixCache's default zeros and
+    # reports a constant one-page "memory leak" whenever any prefix node is
+    # cached.
+    def full_evictable_size(self):
+        return self.evictable_size_
+
+    def swa_evictable_size(self):
+        return self.evictable_size_
+
+    def full_protected_size(self):
+        return self.protected_size_
+
+    def swa_protected_size(self):
+        return self.protected_size_
+
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
