@@ -25,9 +25,10 @@ Layouts
 - indexer host buffers: page-layout mirror of the device pool
   (num_pages, page_bytes), transferred page-wise.
 
-The SWA pool is intentionally NOT backed up on host (phase 1): SWA entries of
-evicted tokens are physically gone, and the tail window is recomputed on
-prefix hit.
+Phase 2 additionally mirrors the SWA KV pool and every compress-state pool,
+page-granular in the host full-token domain like c128/indexer: the
+shadow-slot identity mapping (swa_loc == full_loc) aligns swa pages with
+full-domain pages, and compress-state rows are grouped ring_size-per-swa-page.
 
 NUMA/CXL
 --------
@@ -55,7 +56,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_npu, is_xpu
+from sglang.srt.utils import get_bool_env_var, is_npu, is_xpu
 
 if not (is_npu() or is_xpu()):
     from sgl_kernel.kvcacheio import (
@@ -136,11 +137,41 @@ class DeepSeekV4TokenToKVPoolHost:
         self.c128_page_bytes = c128_pool.bytes_per_page_padded
 
         # Host bytes per 256-full-token block across all mirrored sub pools.
+        # (c4 / c128 / indexer mirrors scale with the host token capacity.)
         self.bytes_per_block = (
             DSV4_KV_ITEM_BYTES * self.c4_slots_per_block * self.c4_layer_num
             + self.c128_page_bytes * self.c128_layer_num
             + self.indexer_page_bytes * self.c4_layer_num
         )
+
+        # Phase 2: SWA KV + compress states are mirrored too (they were
+        # skipped in phase 1, which made restored prefixes lossy: local
+        # needle retrieval survived on full-attention data while global
+        # summarization died on the missing SWA window / compress states).
+        # Both mirrors are page-granular in the host full-token domain, like
+        # c128/indexer — NOT 1:1 device images (device swa slots are recycled
+        # between backup and restore, so device-domain mirrors would go
+        # stale):
+        #   - SWA KV: with the shadow-slot identity mapping swa_loc ==
+        #     full_loc, the device swa page of a 256-token block is exactly
+        #     full_index // 256 (dev_pages); the host mirror is indexed by
+        #     host_index // 256 (host_pages), which the radix tree keeps
+        #     stable across evict/restore cycles.
+        #   - compress states: state rows are grouped ring_size-per-swa-page
+        #     (state_loc = swa_page * ring_size + swa_loc % ring_size), so
+        #     one contiguous group of ring_size rows = one page's states.
+        self.swa_layer_num = device_pool.swa_kv_pool.layer_num
+        self.swa_page_bytes = device_pool.swa_kv_pool.kv_buffer[0].shape[1]
+        self._state_mirrors_plan = []  # (pool, group_bytes)
+        for pool in [
+            *device_pool.compress_state_pools,
+            *device_pool.indexer_compress_state_pools,
+        ]:
+            if pool is None:
+                continue
+            buf = pool.kv_score_buffer.kv_score
+            row_bytes = buf.shape[1] * buf.element_size()
+            self._state_mirrors_plan.append((pool, row_bytes * pool.ring_size))
 
         # Capacity in the full-token domain.
         if host_size > 0:
@@ -155,6 +186,15 @@ class DeepSeekV4TokenToKVPoolHost:
         )
         self.size = self.num_blocks * DSV4_BLOCK_TOKENS
 
+        # Phase 2 mirror cost scales with host capacity (page-granular).
+        self.swa_total_bytes = (
+            self.num_blocks * self.swa_page_bytes * self.swa_layer_num
+        )
+        self.state_total_bytes = sum(
+            self.num_blocks * group_bytes
+            for _, group_bytes in self._state_mirrors_plan
+        )
+
         assert self.size > full_size, (
             "The host memory should be larger than the device memory with the "
             "current protocol"
@@ -162,7 +202,11 @@ class DeepSeekV4TokenToKVPoolHost:
 
         # Verify there is enough available host memory (keep 10GB free).
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.num_blocks * self.bytes_per_block
+        requested_bytes = (
+            self.num_blocks * self.bytes_per_block
+            + self.swa_total_bytes
+            + self.state_total_bytes
+        )
         available_bytes = host_mem.available - 10 * (1024**3)
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -175,9 +219,18 @@ class DeepSeekV4TokenToKVPoolHost:
         self.lock = threading.RLock()
         self.clear()
 
+        # Debug probe (SGLANG_P2_VERIFY=1): byte-compare device vs host
+        # windows right after every kernel copy, for the first few backups
+        # and for all restores. Splits "transfer is unfaithful" from "data
+        # semantics are wrong" when T3 similarity is below 1.0.
+        self.verify = get_bool_env_var("SGLANG_P2_VERIFY")
+        self._verify_backup_budget = 2
+        self.verify_failures = 0
+
         logger.info(
             "DeepSeekV4TokenToKVPoolHost init: blocks=%d (size=%d full tokens), "
             "c4_slots=%d, c128_slots=%d, indexer_pages=%d, bytes/block=%d, "
+            "phase2: swa_layers=%d swa_total=%.2fGB state_total=%.2fGB, "
             "allocator=%s, numa_node=%s",
             self.num_blocks,
             self.size,
@@ -185,6 +238,9 @@ class DeepSeekV4TokenToKVPoolHost:
             self.num_blocks * self.c128_slots_per_block,
             self.num_blocks,
             self.bytes_per_block,
+            self.swa_layer_num,
+            self.swa_total_bytes / 2**30,
+            self.state_total_bytes / 2**30,
             type(self.allocator).__name__,
             numa_node,
         )
@@ -218,6 +274,20 @@ class DeepSeekV4TokenToKVPoolHost:
             for _ in range(self.c4_layer_num)
         ]
 
+        # Phase 2: SWA KV page mirror (same page domain as c128) and one
+        # page-group image per compress-state pool, both indexed by the
+        # tree-bound host page.
+        self.swa_kv_buffer = [
+            _alloc((self.num_blocks, self.swa_page_bytes))
+            for _ in range(self.swa_layer_num)
+        ]
+        self.state_mirrors = []  # (pool, host_tensor, group_bytes)
+        self._state_mirror_map = {}  # id(pool) -> (host_tensor, group_bytes)
+        for pool, group_bytes in self._state_mirrors_plan:
+            host = _alloc((self.num_blocks, group_bytes))
+            self.state_mirrors.append((pool, host, group_bytes))
+            self._state_mirror_map[id(pool)] = (host, group_bytes)
+
         def _ptrs(tensors):
             return torch.tensor(
                 [t.data_ptr() for t in tensors], dtype=torch.uint64, device=dev
@@ -231,6 +301,8 @@ class DeepSeekV4TokenToKVPoolHost:
         self.indexer_device_ptrs = _ptrs(
             self.device_pool.c4_indexer_kv_pool.index_k_with_scale_buffer
         )
+        self.swa_host_ptrs = _ptrs(self.swa_kv_buffer)
+        self.swa_device_ptrs = _ptrs(self.device_pool.swa_kv_pool.kv_buffer)
 
     # ------------------------------------------------------------------
     # Slot management (block granularity, full-token domain interface)
@@ -287,6 +359,11 @@ class DeepSeekV4TokenToKVPoolHost:
         a 256-token boundary at every segment start (guaranteed by the radix
         page semantics), so strided sampling yields one representative per
         c4 group / c128 group / indexer page.
+
+        NOTE: deliberately NOT memoized — the cache controller's index
+        tensors are freed and reallocated between evictions/restores, so a
+        (data_ptr, numel) key can collide across different requests and
+        would silently apply a previous request's slot mapping.
         """
         dev_c4 = device_indices[0::4] // 4
         host_c4 = host_indices[0::4] // 4
@@ -297,17 +374,65 @@ class DeepSeekV4TokenToKVPoolHost:
         return dev_c4, host_c4, dev_c128, host_c128, dev_pages, host_pages
 
     def _split_indices_cached(self, host_indices, device_indices):
-        key = (
-            host_indices.data_ptr(),
-            device_indices.data_ptr(),
-            host_indices.numel(),
+        return self._split_indices(host_indices, device_indices)
+
+    def _verify_windows(self, tag, dev_flat, host_flat, dev_pages, host_pages, item):
+        """Debug probe: byte-compare the copied windows on both sides."""
+        if dev_pages.numel() == 0:
+            return
+        dev_off = dev_pages.to(torch.int64) * item
+        host_off = (host_pages.to(torch.int64) * item).cpu()
+        d = dev_flat[dev_off[:, None] + torch.arange(item, device=dev_flat.device)]
+        h = host_flat[host_off[:, None] + torch.arange(item)]
+        if not torch.equal(d.cpu(), h):
+            bad = (d.cpu() != h).any(dim=1).nonzero().flatten()
+            logger.error(
+                "P2-VERIFY %s MISMATCH: %d/%d windows differ (first dev_page=%d)",
+                tag,
+                bad.numel(),
+                dev_pages.numel(),
+                dev_pages[bad[0]].item() if bad.numel() else -1,
+            )
+            self.verify_failures += 1
+
+    def _verify_backup(self, device_pool, dev_pages, host_pages):
+        """Debug probe: verify all page-domain mirrors after a D2H backup."""
+        if not (self.verify and self._verify_backup_budget > 0):
+            return
+        self._verify_backup_budget -= 1
+        if self.c128_layer_num > 0:
+            for l in range(self.c128_layer_num):
+                self._verify_windows(
+                    f"c128-backup-l{l}",
+                    device_pool.c128_kv_pool.kv_buffer[l].reshape(-1),
+                    self.c128_kv_buffer[l].reshape(-1),
+                    dev_pages,
+                    host_pages,
+                    self.c128_page_bytes,
+                )
+        for l in range(self.swa_layer_num):
+            self._verify_windows(
+                f"swa-backup-l{l}",
+                device_pool.swa_kv_pool.kv_buffer[l].reshape(-1),
+                self.swa_kv_buffer[l].reshape(-1),
+                dev_pages,
+                host_pages,
+                self.swa_page_bytes,
+            )
+        for pool, host_buf, group_bytes in self.state_mirrors:
+            self._verify_windows(
+                f"state-backup-{id(pool)}",
+                pool.kv_score_buffer.kv_score.view(torch.uint8).reshape(-1),
+                host_buf.reshape(-1),
+                dev_pages,
+                host_pages,
+                group_bytes,
+            )
+        logger.info(
+            "P2-VERIFY backup done (failures=%d, budget left=%d)",
+            self.verify_failures,
+            self._verify_backup_budget,
         )
-        if self._split_cache_key == key:
-            return self._split_cache_val
-        val = self._split_indices(host_indices, device_indices)
-        self._split_cache_key = key
-        self._split_cache_val = val
-        return val
 
     # ------------------------------------------------------------------
     # Transfers
@@ -350,6 +475,98 @@ class DeepSeekV4TokenToKVPoolHost:
                 item_size=self.indexer_page_bytes,
                 num_layers=self.c4_layer_num,
             )
+        if self.swa_layer_num > 0 and dev_pages.numel() > 0:
+            # SWA KV: the shadow-slot identity mapping (swa_loc == full_loc)
+            # makes the device swa page of a block exactly dev_pages, so this
+            # mirrors the c128 transfer one-for-one.
+            transfer_kv_all_layer_mla(
+                src_layers=self.swa_device_ptrs,
+                dst_layers=self.swa_host_ptrs,
+                src_indices=dev_pages,
+                dst_indices=host_pages,
+                item_size=self.swa_page_bytes,
+                num_layers=self.swa_layer_num,
+            )
+        self._backup_states(dev_pages, host_pages)
+        self._verify_backup(device_pool, dev_pages, host_pages)
+
+    def _restore_swa_layer(
+        self, device_pool, host_indices, device_indices, swa_layer_id
+    ):
+        """H2D: restore one SWA layer's KV (page-granular).
+
+        The device swa page of a 256-token block is full_index // 256 under
+        the shadow-slot identity mapping, so this mirrors the c128 restore.
+        """
+        if self.swa_layer_num == 0:
+            return
+        _, _, _, _, dev_pages, host_pages = self._split_indices_cached(
+            host_indices, device_indices
+        )
+        if dev_pages.numel() == 0:
+            return
+        transfer_kv_per_layer_mla(
+            src=self.swa_kv_buffer[swa_layer_id],
+            dst=device_pool.swa_kv_pool.kv_buffer[swa_layer_id],
+            src_indices=host_pages,
+            dst_indices=dev_pages,
+            item_size=self.swa_page_bytes,
+        )
+        if self.verify:
+            self._verify_windows(
+                f"swa-restore-l{swa_layer_id}",
+                device_pool.swa_kv_pool.kv_buffer[swa_layer_id].reshape(-1),
+                self.swa_kv_buffer[swa_layer_id].reshape(-1),
+                dev_pages,
+                host_pages,
+                self.swa_page_bytes,
+            )
+
+    def _backup_states(self, dev_pages, host_pages):
+        """D2H: back up per-page compress-state groups of all layers.
+
+        State rows are grouped ring_size-per-swa-page, so one contiguous
+        group of ring_size rows travels per 256-token block. The device side
+        is indexed by the block's device page, the host mirror by its
+        tree-bound host page.
+        """
+        if dev_pages.numel() == 0:
+            return
+        for pool, host_buf, group_bytes in self.state_mirrors:
+            transfer_kv_per_layer_mla(
+                src=pool.kv_score_buffer.kv_score.view(torch.uint8),
+                dst=host_buf,
+                src_indices=dev_pages,
+                dst_indices=host_pages,
+                item_size=group_bytes,
+            )
+
+    def _restore_state_pool(self, pool, host_indices, device_indices):
+        """H2D: restore ONE layer's compress-state pool (per-layer pools)."""
+        if pool is None or id(pool) not in self._state_mirror_map:
+            return
+        host_buf, group_bytes = self._state_mirror_map[id(pool)]
+        _, _, _, _, dev_pages, host_pages = self._split_indices_cached(
+            host_indices, device_indices
+        )
+        if dev_pages.numel() == 0:
+            return
+        transfer_kv_per_layer_mla(
+            src=host_buf,
+            dst=pool.kv_score_buffer.kv_score.view(torch.uint8),
+            src_indices=host_pages,
+            dst_indices=dev_pages,
+            item_size=group_bytes,
+        )
+        if self.verify:
+            self._verify_windows(
+                f"state-restore-{id(pool)}",
+                pool.kv_score_buffer.kv_score.view(torch.uint8).reshape(-1),
+                host_buf.reshape(-1),
+                dev_pages,
+                host_pages,
+                group_bytes,
+            )
 
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend):
         """H2D: restore one model layer (by its layer_mapping entry)."""
@@ -366,7 +583,10 @@ class DeepSeekV4TokenToKVPoolHost:
             layer_id + device_pool.start_layer
         ]
         if compress_ratio == 0:
-            # SWA-only layer: no host backup (phase 1), nothing to restore.
+            # SWA-only layer (phase 2): restore the SWA KV window.
+            self._restore_swa_layer(
+                device_pool, host_indices, device_indices, compress_layer_id
+            )
             return
 
         if compress_ratio == 4:
@@ -394,6 +614,29 @@ class DeepSeekV4TokenToKVPoolHost:
                     dst_indices=dev_pages,
                     item_size=self.indexer_page_bytes,
                 )
+                if self.verify:
+                    self._verify_windows(
+                        f"indexer-restore-l{compress_layer_id}",
+                        device_pool.c4_indexer_kv_pool.index_k_with_scale_buffer[
+                            compress_layer_id
+                        ].reshape(-1),
+                        self.indexer_buffer[compress_layer_id].reshape(-1),
+                        dev_pages,
+                        host_pages,
+                        self.indexer_page_bytes,
+                    )
+            global_layer_id = layer_id + device_pool.start_layer
+            # Per-layer state pools: this layer's own c4 state + indexer state.
+            self._restore_state_pool(
+                device_pool.compress_state_pools[global_layer_id],
+                host_indices,
+                device_indices,
+            )
+            self._restore_state_pool(
+                device_pool.indexer_compress_state_pools[global_layer_id],
+                host_indices,
+                device_indices,
+            )
         elif compress_ratio == 128:
             _, _, _, _, dev_pages, host_pages = self._split_indices_cached(
                 host_indices, device_indices
@@ -406,6 +649,23 @@ class DeepSeekV4TokenToKVPoolHost:
                     dst_indices=dev_pages,
                     item_size=self.c128_page_bytes,
                 )
+                if self.verify:
+                    self._verify_windows(
+                        f"c128-restore-l{compress_layer_id}",
+                        device_pool.c128_kv_pool.kv_buffer[compress_layer_id].reshape(
+                            -1
+                        ),
+                        self.c128_kv_buffer[compress_layer_id].reshape(-1),
+                        dev_pages,
+                        host_pages,
+                        self.c128_page_bytes,
+                    )
+            global_layer_id = layer_id + device_pool.start_layer
+            self._restore_state_pool(
+                device_pool.compress_state_pools[global_layer_id],
+                host_indices,
+                device_indices,
+            )
         else:
             raise ValueError(
                 f"Unsupported compression ratio: {compress_ratio} "
