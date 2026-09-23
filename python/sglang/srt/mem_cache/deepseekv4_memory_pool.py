@@ -680,6 +680,11 @@ class DeepSeekV4TokenToKVPool(KVCache):
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
 
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
+        # Layer-wise HiCache loading sync hook: state rows ride the same
+        # per-layer H2D transfer as the KV buffers, so readers must wait too
+        # (see HiCacheController.start_loading / get_extra_key_buffer).
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         compress_state_pool = self.compress_state_pools[layer_id]
         assert (
             compress_state_pool is not None
@@ -687,6 +692,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
         return compress_state_pool
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
+        # Layer-wise HiCache loading sync hook (same as get_attention_compress_states).
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
         assert (
             indexer_compress_state_pool is not None
@@ -694,6 +702,12 @@ class DeepSeekV4TokenToKVPool(KVCache):
         return indexer_compress_state_pool
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
+        # Layer-wise HiCache loading sync hook: the SWA window of restored
+        # pages lands on the same per-layer H2D transfer as the compressed
+        # domains; without this wait the SWA attention reads slots before
+        # their host->device copy completes.
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
 
@@ -787,6 +801,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
+        # Layer-wise HiCache loading sync hook (same as get_swa_key_buffer).
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
     def set_swa_key_buffer_radix_fused(
