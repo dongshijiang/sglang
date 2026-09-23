@@ -98,10 +98,18 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        memory_leak = full_num_used != 0 or swa_num_used != 0
+        # `used` = total - available - evictable. Tree nodes locked (protected)
+        # — e.g. HiCache nodes awaiting async host backup after request finish
+        # — also live in that delta, so idle `used != 0` false-positives.
+        # Clean iff locked slots exactly account for the delta.
+        full_protected_size = self.tree_cache.full_protected_size()
+        swa_protected_size = self.tree_cache.swa_protected_size()
+        memory_leak = (
+            full_num_used != full_protected_size or swa_num_used != swa_protected_size
+        )
         token_msg = (
-            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected_size=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected_size=}\n"
         )
         return memory_leak, token_msg
 

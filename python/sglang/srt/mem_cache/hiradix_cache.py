@@ -849,6 +849,12 @@ class HiRadixCache(RadixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # [IDEMPOTENCE-GUARD] the snapshot may contain nodes already evicted
+            # by another path (e.g. host-restore handoff); skipping keeps the
+            # ledger and leaf sets consistent.
+            if x.evicted:
+                continue
+
             if x.lock_ref > 0:
                 continue
 
@@ -875,6 +881,14 @@ class HiRadixCache(RadixCache):
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
             for node in write_back_nodes:
+                # [IDEMPOTENCE-GUARD] node may have been evicted by another
+                # path while the write-back was in flight.
+                if node.value is None:
+                    logger.warning(
+                        "[IDEMPOTENCE-GUARD] write-back node %s already evicted, skip second eviction",
+                        node.id,
+                    )
+                    continue
                 assert node.backuped
                 self._evict_backuped(node)
 
@@ -882,6 +896,14 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
+        # [IDEMPOTENCE-GUARD] double-eviction guard: an already-evicted node
+        # must not free its slots twice nor skew the evictable counters.
+        if node.value is None:
+            logger.warning(
+                "[IDEMPOTENCE-GUARD] _evict_backuped on already-evicted node %s, skipped",
+                node.id,
+            )
+            return 0
         # evict a node already written to host
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
@@ -894,6 +916,13 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
+        # [IDEMPOTENCE-GUARD] double-eviction guard
+        if node.value is None:
+            logger.warning(
+                "[IDEMPOTENCE-GUARD] _evict_regular on already-evicted node %s, skipped",
+                node.id,
+            )
+            return 0
         # evict a node not initiated write to host
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)

@@ -1,4 +1,5 @@
 import logging
+import traceback
 import weakref
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -13,6 +14,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -294,6 +296,36 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ]
         )
 
+        # [SHADOW-SLOT] Identity mapping (swa index == full index): every full
+        # slot owns its swa twin by construction. Host-restore paths that only
+        # alloc full slots (cache_controller.load) then implicitly own the swa
+        # side too — no mapping to desync, no separate swa ledger to drift.
+        # Root fix for the two DSV4 HiCache bugs: restored prefixes previously
+        # had mapping=0 (swa attention read the dummy slot 0 => lossy KV) and
+        # the swa ledger was never debited for them (tree counted them as
+        # swa_evictable => swa_num_used < 0 crash). Requires the swa pool to
+        # be at least as large as the full pool (--swa-full-tokens-ratio >= 1.0).
+        self._shadow_slot = get_bool_env_var("SGLANG_SWA_SHADOW_SLOT")
+        if self._shadow_slot:
+            assert self._size_swa >= self._size_full, (
+                "SGLANG_SWA_SHADOW_SLOT=1 requires swa pool >= full pool "
+                "(--swa-full-tokens-ratio >= 1.0)"
+            )
+            self.full_to_swa_index_mapping[:-1] = torch.arange(
+                size + self.page_size, dtype=torch.int64, device=device
+            )
+
+        # [IDEMPOTENCE-GUARD] tracks which full slots are currently handed out.
+        # Guards the non-idempotent free() API against double-free: a slot not
+        # marked occupied is skipped on free with an error log instead of being
+        # re-inserted into the free list (which corrupts the allocator ledger
+        # and later hands the same slot to two live requests).
+        self.full_occupied = torch.zeros(
+            size + self.page_size + 1, dtype=torch.bool, device=device
+        )
+        self._double_free_count = 0
+        self._double_free_stack_logged = False
+
         self.need_sort = need_sort
         self.free_pages = None
         self.release_pages = None
@@ -305,6 +337,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
 
     def available_size(self):
+        if self._shadow_slot:
+            return self.full_attn_allocator.available_size()
         return min(
             self.full_attn_allocator.available_size(),
             self.swa_attn_allocator.available_size(),
@@ -314,6 +348,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.available_size()
 
     def swa_available_size(self):
+        if self._shadow_slot:
+            # Lockstep mirror of the full allocator: a bypassing alloc (e.g.
+            # host-restore in cache_controller.load) cannot desync the swa
+            # ledger because there is no separate swa ledger anymore.
+            return self.full_attn_allocator.available_size()
         return self.swa_attn_allocator.available_size()
 
     @property
@@ -330,7 +369,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def debug_print(self) -> str:
         msg = ""
-        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        msg += f"#swa-available-size: {self.swa_available_size()}, "
         msg += (
             f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
         )
@@ -343,19 +382,46 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
+    def _mark_occupied(self, alloc_full_indices: torch.Tensor):
+        occ = self.full_occupied[alloc_full_indices]
+        if bool(occ.any()):
+            # Free list handed out slots that were never freed (or double-freed
+            # earlier): hard evidence of ledger corruption.
+            dirty = alloc_full_indices[occ]
+            logger.error(
+                f"[IDEMPOTENCE-GUARD] alloc returned OCCUPIED full slots "
+                f"(dirty free list): {dirty[:16].tolist()}"
+            )
+        self.full_occupied[alloc_full_indices] = True
+
+    def _report_double_free(self, stale: torch.Tensor):
+        self._double_free_count += len(stale)
+        logger.error(
+            f"[IDEMPOTENCE-GUARD] blocked double-free on {len(stale)} full slots "
+            f"(total blocked: {self._double_free_count}): {stale[:16].tolist()}"
+        )
+        if not self._double_free_stack_logged:
+            self._double_free_stack_logged = True
+            logger.error(
+                "[IDEMPOTENCE-GUARD] first double-free stack:\n"
+                + "".join(traceback.format_stack()[-9:-1])
+            )
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
             return None
-        if need_size > self.swa_attn_allocator.available_size():
+        if not self._shadow_slot and need_size > self.swa_attn_allocator.available_size():
             return None
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._mark_occupied(alloc_full_indices)
+        if not self._shadow_slot:
+            alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+            assert alloc_swa_indices is not None
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -370,13 +436,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.page_size > 1
         num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
         msg = f"[ALLOC-EXTEND-{get_tp_group().rank}] {num_tokens=}, {extend_num_tokens=}, {len(seq_lens)=}, {self.page_size=}"
-        msg += f", {self.full_attn_allocator.available_size()=}, {self.swa_attn_allocator.available_size()=}"
+        msg += f", {self.full_attn_allocator.available_size()=}, {self.swa_available_size()=}"
         if num_tokens > self.full_attn_allocator.available_size():
             return None
-        if num_tokens > self.swa_attn_allocator.available_size():
+        if not self._shadow_slot and num_tokens > self.swa_attn_allocator.available_size():
             return None
-
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
@@ -386,18 +450,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            swa_last_loc,
-            extend_num_tokens,
-        )
         assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._mark_occupied(alloc_full_indices)
+        if not self._shadow_slot:
+            swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+            alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                swa_last_loc,
+                extend_num_tokens,
+            )
+            assert alloc_swa_indices is not None
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -408,19 +475,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1
-        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
-        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, swa_last_loc
-        )
 
-        if alloc_full_indices is None or alloc_swa_indices is None:
+        if not self._shadow_slot:
+            swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+            alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, swa_last_loc
+            )
+            if alloc_full_indices is None or alloc_swa_indices is None:
+                return None
+        elif alloc_full_indices is None:
             return None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        self._mark_occupied(alloc_full_indices)
+        if not self._shadow_slot:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -429,9 +501,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
+        # [IDEMPOTENCE-GUARD] slots not marked occupied were already freed:
+        # skip them (and their swa counterpart via the mapping) instead of
+        # re-inserting them into the free list.
         if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
+            occupied = self.full_occupied[free_index]
+            if not bool(occupied.all()):
+                self._report_double_free(free_index[~occupied])
+            valid = free_index[occupied]
+            if valid.numel() > 0:
+                self.full_attn_allocator.free(valid)
+                if not self._shadow_slot:
+                    self.free_swa(valid)
+                self.full_occupied[valid] = False
         else:
             self.free_group.append(free_index)
         assert (
@@ -440,6 +522,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
+        if self._shadow_slot:
+            # Swa slots die together with their full slots; early-free callers
+            # (ScheduleBatch.maybe_evict_swa) may keep advancing their pointers,
+            # the buffer slots simply stay valid until the full slot recycles.
+            return
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
@@ -460,7 +547,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
-        self.full_to_swa_index_mapping[:-1].fill_(0)
+        if self._shadow_slot:
+            self.full_to_swa_index_mapping[:-1] = torch.arange(
+                self._size_full + self.page_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            self.full_to_swa_index_mapping[:-1].fill_(0)
+        self.full_occupied.fill_(False)
         self.is_not_in_free_group = True
         self.free_group = []
 

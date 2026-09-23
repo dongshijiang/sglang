@@ -705,6 +705,15 @@ class HiCacheController:
         )
         if full_allocator is not None:
             device_indices = full_allocator.alloc(len(host_indices))
+            if device_indices is not None:
+                mark_occupied = getattr(
+                    self.mem_pool_device_allocator, "_mark_occupied", None
+                )
+                if mark_occupied is not None:
+                    # [IDEMPOTENCE-GUARD] restore bypasses the wrapper alloc();
+                    # mark the slots so a later free() is not mistaken for a
+                    # double-free (which would leak them).
+                    mark_occupied(device_indices)
         else:
             device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
