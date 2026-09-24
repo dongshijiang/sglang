@@ -1425,9 +1425,13 @@ class ServerArgs:
             ], f"{self.kv_cache_dtype} is not supported for {model_arch}"
 
             if self.speculative_algorithm is not None:
-                assert (
-                    self.speculative_algorithm == "EAGLE"
-                ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
+                # NEXTN (DeepSeek MTP) is handled by the same EAGLE worker path
+                # (normalized to EAGLE in _handle_speculative_settings) with the
+                # draft arch converted to DeepseekV4ForCausalLMNextN.
+                assert self.speculative_algorithm in (
+                    "EAGLE",
+                    "NEXTN",
+                ), f"Only EAGLE/NEXTN speculative algorithm is supported for {model_arch}"
                 assert (
                     self.speculative_eagle_topk == 1
                 ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
