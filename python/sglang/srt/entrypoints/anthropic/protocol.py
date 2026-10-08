@@ -51,9 +51,14 @@ class AnthropicContentBlock(BaseModel):
 
 
 class AnthropicMessage(BaseModel):
-    """Message structure"""
+    """Message structure
 
-    role: Literal["user", "assistant"]
+    KT: role is relaxed from Literal["user", "assistant"] to str so that
+    OpenAI-style clients that inline system prompts as messages are accepted;
+    serving.py lifts role="system" messages into the leading system message.
+    """
+
+    role: str
     content: str | list[AnthropicContentBlock]
 
 

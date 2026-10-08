@@ -92,22 +92,39 @@ class AnthropicServing:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
 
-        # Add system message if provided
-        if anthropic_request.system:
-            if isinstance(anthropic_request.system, str):
-                openai_messages.append(
-                    {"role": "system", "content": anthropic_request.system}
-                )
+        # KT: OpenAI-style clients inline system prompts as messages
+        # (role="system" in messages); Anthropic spec keeps system at top
+        # level. Lift them into the leading system message so both dialects
+        # work. Native Anthropic clients are unaffected.
+        inline_system = []
+        for msg in anthropic_request.messages:
+            if msg.role != "system":
+                continue
+            if isinstance(msg.content, str):
+                inline_system.append(msg.content)
             else:
-                system_parts = []
+                inline_system.extend(
+                    block.text
+                    for block in msg.content
+                    if block.type == "text" and block.text
+                )
+
+        # Add system message if provided
+        if anthropic_request.system or inline_system:
+            system_parts = []
+            if isinstance(anthropic_request.system, str):
+                system_parts.append(anthropic_request.system)
+            elif anthropic_request.system:
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
-                system_text = "\n".join(system_parts)
-                openai_messages.append({"role": "system", "content": system_text})
+            system_parts.extend(inline_system)
+            openai_messages.append({"role": "system", "content": "\n".join(system_parts)})
 
         # Convert messages
         for msg in anthropic_request.messages:
+            if msg.role == "system":
+                continue  # lifted into the system message above
             if isinstance(msg.content, str):
                 openai_messages.append({"role": msg.role, "content": msg.content})
                 continue
