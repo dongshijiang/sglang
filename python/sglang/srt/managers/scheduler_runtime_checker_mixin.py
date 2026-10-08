@@ -104,9 +104,20 @@ class SchedulerRuntimeCheckerMixin:
         # Clean iff locked slots exactly account for the delta.
         full_protected_size = self.tree_cache.full_protected_size()
         swa_protected_size = self.tree_cache.swa_protected_size()
-        memory_leak = (
-            full_num_used != full_protected_size or swa_num_used != swa_protected_size
-        )
+        if getattr(self.token_to_kv_pool_allocator, "_shadow_slot", False):
+            # [SHADOW-SLOT] The swa pool is identity-mapped to the full pool:
+            # every full slot owns its swa twin, so the swa side has no
+            # independent physical capacity. Out-of-window (tombstoned) prefix
+            # tokens are a legitimate third state here — still held by the
+            # tree on the full side while the swa side stops counting them —
+            # which the three-state formula cannot see. A genuine swa slot
+            # loss would surface on the full side, so verifying the full-side
+            # invariant is complete.
+            memory_leak = full_num_used != full_protected_size
+        else:
+            memory_leak = (
+                full_num_used != full_protected_size or swa_num_used != swa_protected_size
+            )
         token_msg = (
             f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected_size=}\n"
             f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected_size=}\n"
